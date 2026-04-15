@@ -1,6 +1,12 @@
-const API_BASE =
-  (import.meta.env.VITE_API_URL as string | undefined)?.trim() ||
-  'http://127.0.0.1:8000/api';
+const PROD_API_URL = 'https://fluxo-caixa-b0oj.onrender.com/api';
+const LOCAL_API_URL = 'http://127.0.0.1:8000/api';
+
+const envApiUrl = import.meta.env.VITE_API_URL?.trim();
+
+const isGitHubPages =
+  window.location.hostname === 'rodrigobrasil-stack.github.io';
+
+const API_BASE = envApiUrl || (isGitHubPages ? PROD_API_URL : LOCAL_API_URL);
 
 function buildUrl(path: string): string {
   const base = API_BASE.endsWith('/') ? API_BASE.slice(0, -1) : API_BASE;
@@ -21,10 +27,13 @@ async function handleResponse<T>(res: Response): Promise<T> {
   return res.json();
 }
 
-async function fetchWithError(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+async function fetchWithError(
+  input: RequestInfo | URL,
+  init?: RequestInit
+): Promise<Response> {
   try {
     return await fetch(input, init);
-  } catch (error) {
+  } catch {
     throw new Error(
       `Não foi possível conectar à API. Verifique a URL "${API_BASE}", o CORS e se o backend está online.`
     );
