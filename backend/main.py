@@ -7,6 +7,7 @@ from datetime import datetime
 import time
 import re
 import unicodedata
+import os
 
 import requests
 from fastapi import FastAPI, HTTPException
@@ -25,8 +26,24 @@ SHEETS = {
     "DespesasMes": ["id", "conta_mes", "descricao", "vencimento", "forma_pagamento", "valor", "status"],
 }
 
-TELEGRAM_BOT_TOKEN = "8510414795:AAEozweyM6yB2HqgHkVGPwILdNYgR-pkfVM"
-TELEGRAM_ALLOWED_CHAT_ID = "6310338758"
+# =========================
+# VARIÁVEIS DE AMBIENTE
+# =========================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_ALLOWED_CHAT_ID = os.getenv("TELEGRAM_ALLOWED_CHAT_ID", "").strip()
+
+# Exemplo:
+# BACKEND_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,https://SEU_USUARIO.github.io
+cors_origins_env = os.getenv(
+    "BACKEND_CORS_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173"
+).strip()
+
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in cors_origins_env.split(",")
+    if origin.strip()
+]
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
 telegram_offset = 0
@@ -71,11 +88,13 @@ class DespesaOut(DespesaIn):
     id: int
 
 
-app = FastAPI(title="Fluxo de Caixa API", version="1.2.4")
+app = FastAPI(title="Fluxo de Caixa API", version="1.3.0")
 
+# IMPORTANTE:
+# se usar allow_credentials=True, não use allow_origins=["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -269,6 +288,9 @@ def calcular_resumo() -> dict:
 
 
 def telegram_send_message(chat_id: str, text: str) -> None:
+    if not TELEGRAM_API_URL:
+        return
+
     try:
         response = requests.post(
             f"{TELEGRAM_API_URL}/sendMessage",
@@ -281,6 +303,9 @@ def telegram_send_message(chat_id: str, text: str) -> None:
 
 
 def telegram_delete_webhook():
+    if not TELEGRAM_API_URL:
+        return
+
     try:
         r = requests.get(f"{TELEGRAM_API_URL}/deleteWebhook", timeout=20)
         print(f"[Telegram] deleteWebhook => {r.status_code} | {r.text}")
@@ -289,6 +314,9 @@ def telegram_delete_webhook():
 
 
 def telegram_get_me():
+    if not TELEGRAM_API_URL:
+        return
+
     try:
         r = requests.get(f"{TELEGRAM_API_URL}/getMe", timeout=20)
         print(f"[Telegram] getMe => {r.status_code} | {r.text}")
@@ -297,6 +325,9 @@ def telegram_get_me():
 
 
 def telegram_get_updates(offset: int = 0) -> list[dict]:
+    if not TELEGRAM_API_URL:
+        return []
+
     try:
         response = requests.get(
             f"{TELEGRAM_API_URL}/getUpdates",
@@ -499,7 +530,7 @@ def processar_update(update: dict) -> None:
             print(f"[Telegram] Saída salva no Excel: {item}")
 
             aviso = ""
-            if str(item["forma_pagamento"]).lower() == "cartão de crédito":
+            if str(item["forma_pagamento"]).strip().lower() in ["cartão de crédito", "cartao de credito"]:
                 aviso = "\n\nℹ️ Registrado apenas como cartão de crédito. Não debita do saldo atual."
 
             telegram_send_message(
@@ -606,6 +637,7 @@ def telegram_polling_loop():
 def startup_event():
     init_workbook()
     print(f"[API] XLSX_PATH = {XLSX_PATH}")
+    print(f"[API] ALLOWED_ORIGINS = {ALLOWED_ORIGINS}")
 
     if TELEGRAM_BOT_TOKEN:
         telegram_get_me()
@@ -622,8 +654,19 @@ def health_check():
     return {
         "status": "ok",
         "xlsx": str(XLSX_PATH),
+        "xlsx_exists": XLSX_PATH.exists(),
         "telegram": "ativo" if TELEGRAM_BOT_TOKEN else "desativado",
         "allowed_chat_id": TELEGRAM_ALLOWED_CHAT_ID or "não definido",
+        "allowed_origins": ALLOWED_ORIGINS,
+    }
+
+
+@app.get("/")
+def root():
+    return {
+        "message": "Fluxo de Caixa API online",
+        "docs": "/docs",
+        "health": "/api/health",
     }
 
 

@@ -1,9 +1,9 @@
 {
-  "homepage": "https://rodrigobrasil-stack.github.io/fluxo-caixa",
   "name": "fluxo-caixa",
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "homepage": "https://rodrigobrasil-stack.github.io/fluxo-caixa",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
@@ -28,7 +28,7 @@
     "autoprefixer": "^10.4.27",
     "gh-pages": "^6.3.0",
     "postcss": "^8.5.9",
-    "tailwindcss": "^4.2.2",
+    "tailwindcss": "^4.1.0",
     "typescript": "~5.8.3",
     "vite": "^7.1.0"
   }

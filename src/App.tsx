@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Wallet, Landmark, ArrowDownCircle, ArrowUpCircle, CreditCard, BarChart3 } from 'lucide-react';
+import { Wallet, Landmark, ArrowDownCircle, ArrowUpCircle, CreditCard, BarChart3, RefreshCw } from 'lucide-react';
 import {
   ComposedChart,
   Bar,
@@ -66,11 +66,22 @@ type DespesaUI = {
   status: 'Pendente' | 'Pago' | 'Vencido';
 };
 
+type ApiHealth = {
+  status: string;
+  xlsx?: string;
+  xlsx_exists?: boolean;
+  telegram?: string;
+  allowed_chat_id?: string;
+  allowed_origins?: string[];
+};
+
 export default function FluxoCaixaApp() {
   const [activeView, setActiveView] = useState('Dashboard');
   const [periodo, setPeriodo] = useState('Abril / 2026');
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [apiHealth, setApiHealth] = useState<ApiHealth | null>(null);
 
   const periodOptions = [
     { label: 'Abril / 2026', month: 4, year: 2026, short: 'Abr' },
@@ -196,6 +207,27 @@ export default function FluxoCaixaApp() {
     return new Date(parsed.year, parsed.month - 1, parsed.day);
   };
 
+  const toDateInputValue = (value: string) => {
+    const parsed = parseDate(value);
+    if (!parsed) return value;
+    const day = String(parsed.day).padStart(2, '0');
+    const month = String(parsed.month).padStart(2, '0');
+    return `${parsed.year}-${month}-${day}`;
+  };
+
+  const fromDateInputValue = (value: string) => {
+    if (!value) return value;
+    const [year, month, day] = value.split('-');
+    return year && month && day ? `${day}/${month}/${year}` : value;
+  };
+
+  const sortByDateDesc = <T,>(items: T[], getValue: (item: T) => string) =>
+    [...items].sort((a, b) => {
+      const dateA = toDate(getValue(a))?.getTime() || 0;
+      const dateB = toDate(getValue(b))?.getTime() || 0;
+      return dateB - dateA;
+    });
+
   const getContaStatus = (item: DespesaUI) => {
     if (item.status === 'Pago') return 'Pago';
     const vencimento = toDate(item.vencimento);
@@ -233,6 +265,15 @@ export default function FluxoCaixaApp() {
     status: item.status,
   });
 
+  async function carregarHealth() {
+    try {
+      const health = await getJSON<ApiHealth>('/health');
+      setApiHealth(health);
+    } catch {
+      setApiHealth(null);
+    }
+  }
+
   async function carregarEntradas() {
     const data = await getJSON<Entrada[]>('/entradas');
     setEntradas(data);
@@ -248,35 +289,42 @@ export default function FluxoCaixaApp() {
     setContasPagar(data.map(mapDespesaApiToUI));
   }
 
-  async function carregarTudo() {
-    setLoading(true);
+  async function carregarTudo(showMainLoading = true) {
+    if (showMainLoading) {
+      setLoading(true);
+    } else {
+      setRefreshing(true);
+    }
+
     setError(null);
+
     try {
-      await Promise.all([carregarEntradas(), carregarSaidas(), carregarDespesas()]);
+      await Promise.all([carregarHealth(), carregarEntradas(), carregarSaidas(), carregarDespesas()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao carregar dados');
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   }
 
   useEffect(() => {
-    carregarTudo();
+    carregarTudo(true);
   }, []);
 
   const entradasFiltradas = useMemo(
-    () => entradas.filter((item) => matchesSelectedPeriod(item.data)),
-    [entradas, periodo]
+    () => sortByDateDesc(entradas.filter((item) => matchesSelectedPeriod(item.data)), (item) => item.data),
+    [entradas, selectedPeriod]
   );
 
   const saidasFiltradas = useMemo(
-    () => saidas.filter((item) => matchesSelectedPeriod(item.data)),
-    [saidas, periodo]
+    () => sortByDateDesc(saidas.filter((item) => matchesSelectedPeriod(item.data)), (item) => item.data),
+    [saidas, selectedPeriod]
   );
 
   const contasPagarFiltradas = useMemo(
-    () => contasPagar.filter((item) => matchesSelectedPeriod(item.vencimento)),
-    [contasPagar, periodo]
+    () => sortByDateDesc(contasPagar.filter((item) => matchesSelectedPeriod(item.vencimento)), (item) => item.vencimento),
+    [contasPagar, selectedPeriod]
   );
 
   const totais = useMemo(() => {
@@ -287,7 +335,7 @@ export default function FluxoCaixaApp() {
       .filter((item) => item.forma !== 'Cartão de Crédito')
       .reduce((acc, item) => acc + Number(item.valor || 0), 0);
 
-    const totalCartaoCredito = saidas
+    const totalCartaoCredito = saidasFiltradas
       .filter((item) => item.status === 'Pago' && item.forma === 'Cartão de Crédito')
       .reduce((acc, item) => acc + Number(item.valor || 0), 0);
 
@@ -309,7 +357,7 @@ export default function FluxoCaixaApp() {
       totalContasVencidas,
       totalCartaoCredito,
     };
-  }, [entradasFiltradas, saidasFiltradas, contasPagarFiltradas, saidas]);
+  }, [entradasFiltradas, saidasFiltradas, contasPagarFiltradas]);
 
   const fluxoMensalChart = useMemo(() => {
     return periodOptions.map((option) => {
@@ -402,10 +450,7 @@ export default function FluxoCaixaApp() {
         status: getContaStatus(item),
       }));
 
-    const toSortableDate = (value: string) => {
-      const [day, month, year] = value.split('/').map(Number);
-      return new Date(year, month - 1, day).getTime();
-    };
+    const toSortableDate = (value: string) => toDate(value)?.getTime() || 0;
 
     return [...itensEntradas, ...itensSaidas, ...itensContas]
       .sort((a, b) => toSortableDate(b.data) - toSortableDate(a.data))
@@ -817,14 +862,33 @@ export default function FluxoCaixaApp() {
     );
   };
 
+  const limparEntradaForm = () => {
+    setEntradaForm({ data: '', descricao: '', categoria: 'Serviços', valor: '' });
+    setSelectedEntradaId(null);
+  };
+
+  const limparSaidaForm = () => {
+    setSaidaForm({ data: '', descricao: '', categoria: 'Água', forma: 'PIX', valor: '' });
+    setSelectedSaidaId(null);
+  };
+
+  const limparContaForm = () => {
+    setContaForm({
+      contaMes: 'Água',
+      descricao: '',
+      vencimento: '',
+      formaPagamento: 'PIX',
+      valor: '',
+      status: 'Pendente',
+    });
+    setSelectedContaId(null);
+  };
+
   const addEntrada = async () => {
     if (!entradaForm.data || !entradaForm.descricao || !entradaForm.valor) return;
 
-    const [year, month, day] = entradaForm.data.split('-');
-    const dataFormatada = year && month && day ? `${day}/${month}/${year}` : entradaForm.data;
-
     const payload = {
-      data: dataFormatada,
+      data: fromDateInputValue(entradaForm.data),
       descricao: entradaForm.descricao,
       categoria: entradaForm.categoria,
       valor: parseCurrencyInput(entradaForm.valor),
@@ -839,8 +903,7 @@ export default function FluxoCaixaApp() {
         await postJSON('/entradas', payload);
       }
 
-      setEntradaForm({ data: '', descricao: '', categoria: 'Serviços', valor: '' });
-      setSelectedEntradaId(null);
+      limparEntradaForm();
       await carregarEntradas();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao salvar entrada');
@@ -850,11 +913,8 @@ export default function FluxoCaixaApp() {
   const addSaida = async () => {
     if (!saidaForm.data || !saidaForm.descricao || !saidaForm.valor) return;
 
-    const [year, month, day] = saidaForm.data.split('-');
-    const dataFormatada = year && month && day ? `${day}/${month}/${year}` : saidaForm.data;
-
     const payload = {
-      data: dataFormatada,
+      data: fromDateInputValue(saidaForm.data),
       descricao: saidaForm.descricao,
       categoria: saidaForm.categoria,
       forma_pagamento: saidaForm.forma,
@@ -870,8 +930,7 @@ export default function FluxoCaixaApp() {
         await postJSON('/saidas', payload);
       }
 
-      setSaidaForm({ data: '', descricao: '', categoria: 'Água', forma: 'PIX', valor: '' });
-      setSelectedSaidaId(null);
+      limparSaidaForm();
       await carregarSaidas();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao salvar saída');
@@ -881,13 +940,10 @@ export default function FluxoCaixaApp() {
   const addConta = async () => {
     if (!contaForm.contaMes || !contaForm.descricao || !contaForm.vencimento || !contaForm.valor) return;
 
-    const [year, month, day] = contaForm.vencimento.split('-');
-    const dataFormatada = year && month && day ? `${day}/${month}/${year}` : contaForm.vencimento;
-
     const payload = {
       conta_mes: contaForm.contaMes,
       descricao: contaForm.descricao,
-      vencimento: dataFormatada,
+      vencimento: fromDateInputValue(contaForm.vencimento),
       forma_pagamento: contaForm.formaPagamento,
       valor: parseCurrencyInput(contaForm.valor),
       status: contaForm.status === 'Pago' ? 'Pago' : 'Pendente',
@@ -901,15 +957,7 @@ export default function FluxoCaixaApp() {
         await postJSON('/despesas', payload);
       }
 
-      setContaForm({
-        contaMes: 'Água',
-        descricao: '',
-        vencimento: '',
-        formaPagamento: 'PIX',
-        valor: '',
-        status: 'Pendente',
-      });
-      setSelectedContaId(null);
+      limparContaForm();
       await carregarDespesas();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao salvar despesa');
@@ -917,12 +965,10 @@ export default function FluxoCaixaApp() {
   };
 
   const fillContaForm = (item: DespesaUI) => {
-    const [day, month, year] = item.vencimento.split('/');
-    const vencimentoFormatado = day && month && year ? `${year}-${month}-${day}` : item.vencimento;
     setContaForm({
       contaMes: item.contaMes || item.categoria || 'Água',
       descricao: item.descricao || '',
-      vencimento: vencimentoFormatado,
+      vencimento: toDateInputValue(item.vencimento),
       formaPagamento: item.formaPagamento || 'PIX',
       valor: item.valor ? formatCurrency(item.valor) : '',
       status: getContaStatus(item) === 'Pago' ? 'Pago' : 'Pendente',
@@ -935,8 +981,7 @@ export default function FluxoCaixaApp() {
     try {
       setError(null);
       await deleteJSON(`/despesas/${selectedContaId}`);
-      setContaForm({ contaMes: 'Água', descricao: '', vencimento: '', formaPagamento: 'PIX', valor: '', status: 'Pendente' });
-      setSelectedContaId(null);
+      limparContaForm();
       await carregarDespesas();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao excluir despesa');
@@ -944,10 +989,8 @@ export default function FluxoCaixaApp() {
   };
 
   const fillEntradaForm = (item: Entrada) => {
-    const [day, month, year] = item.data.split('/');
-    const dataFormatada = day && month && year ? `${year}-${month}-${day}` : item.data;
     setEntradaForm({
-      data: dataFormatada,
+      data: toDateInputValue(item.data),
       descricao: item.descricao || '',
       categoria: item.categoria || 'Serviços',
       valor: item.valor ? formatCurrency(item.valor) : '',
@@ -960,8 +1003,7 @@ export default function FluxoCaixaApp() {
     try {
       setError(null);
       await deleteJSON(`/entradas/${selectedEntradaId}`);
-      setEntradaForm({ data: '', descricao: '', categoria: 'Serviços', valor: '' });
-      setSelectedEntradaId(null);
+      limparEntradaForm();
       await carregarEntradas();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao excluir entrada');
@@ -969,10 +1011,8 @@ export default function FluxoCaixaApp() {
   };
 
   const fillSaidaForm = (item: SaidaUI) => {
-    const [day, month, year] = item.data.split('/');
-    const dataFormatada = day && month && year ? `${year}-${month}-${day}` : item.data;
     setSaidaForm({
-      data: dataFormatada,
+      data: toDateInputValue(item.data),
       descricao: item.descricao || '',
       categoria: item.categoria || 'Água',
       forma: item.forma || 'PIX',
@@ -986,8 +1026,7 @@ export default function FluxoCaixaApp() {
     try {
       setError(null);
       await deleteJSON(`/saidas/${selectedSaidaId}`);
-      setSaidaForm({ data: '', descricao: '', categoria: 'Água', forma: 'PIX', valor: '' });
-      setSelectedSaidaId(null);
+      limparSaidaForm();
       await carregarSaidas();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao excluir saída');
@@ -1003,27 +1042,63 @@ export default function FluxoCaixaApp() {
     </div>
   );
 
-  const TopActions = () => (
-    <div className="flex flex-wrap gap-3">
-      <select
-        value={periodo}
-        onChange={(e) => setPeriodo(e.target.value)}
-        className="rounded-2xl border border-white/70 bg-white/85 backdrop-blur-sm px-4 py-3 text-sm font-medium text-slate-700 shadow-sm"
-      >
-        {periodOptions.map((option) => (
-          <option key={option.label} value={option.label}>
-            {option.label}
-          </option>
-        ))}
-      </select>
-      <button onClick={exportDashboardExcel} className={`${primaryButtonClass} bg-gradient-to-r from-slate-900 to-slate-700`}>
-        Exportar Excel
-      </button>
-      <button onClick={exportDashboardPdf} className={`${primaryButtonClass} bg-gradient-to-r from-rose-600 to-red-500`}>
-        Exportar PDF
-      </button>
-    </div>
-  );
+  const TopActions = () => {
+    const handleExportExcel = () => {
+      switch (activeView) {
+        case 'Entradas':
+          return exportEntradasExcel();
+        case 'Saídas':
+          return exportSaidasExcel();
+        case 'Despesas do Mês':
+          return exportContasExcel();
+        case 'Relatórios':
+          return exportResumoMensalExcel();
+        default:
+          return exportDashboardExcel();
+      }
+    };
+
+    const handleExportPdf = () => {
+      switch (activeView) {
+        case 'Entradas':
+          return exportEntradasPdf();
+        case 'Saídas':
+          return exportSaidasPdf();
+        case 'Despesas do Mês':
+          return exportContasPdf();
+        case 'Relatórios':
+          return exportResumoMensalPdf();
+        default:
+          return exportDashboardPdf();
+      }
+    };
+
+    return (
+      <div className="flex flex-wrap gap-3">
+        <select
+          value={periodo}
+          onChange={(e) => setPeriodo(e.target.value)}
+          className="rounded-2xl border border-white/70 bg-white/85 backdrop-blur-sm px-4 py-3 text-sm font-medium text-slate-700 shadow-sm"
+        >
+          {periodOptions.map((option) => (
+            <option key={option.label} value={option.label}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+        <button onClick={() => carregarTudo(false)} className={secondaryButtonClass} disabled={refreshing}>
+          <RefreshCw className={`mr-2 h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+          Recarregar
+        </button>
+        <button onClick={handleExportExcel} className={`${primaryButtonClass} bg-gradient-to-r from-slate-900 to-slate-700`}>
+          Exportar Excel
+        </button>
+        <button onClick={handleExportPdf} className={`${primaryButtonClass} bg-gradient-to-r from-rose-600 to-red-500`}>
+          Exportar PDF
+        </button>
+      </div>
+    );
+  };
 
   const BackButton = () => (
     <div className="mb-5 flex justify-start">
@@ -1226,6 +1301,13 @@ export default function FluxoCaixaApp() {
                     </td>
                   </tr>
                 ))}
+                {!movimentacoes.length && (
+                  <tr>
+                    <td colSpan={7} className="py-8 text-center text-slate-500">
+                      Nenhuma movimentação encontrada para o período selecionado.
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
@@ -1294,12 +1376,15 @@ export default function FluxoCaixaApp() {
               />
             </div>
             {selectedEntradaId ? (
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <button onClick={addEntrada} className="w-full rounded-xl bg-blue-600 text-white px-4 py-3 text-sm font-medium">
-                  Atualizar Entrada
+                  Atualizar
                 </button>
                 <button onClick={deleteEntrada} className="w-full rounded-xl bg-red-600 text-white px-4 py-3 text-sm font-medium">
-                  Excluir Entrada
+                  Excluir
+                </button>
+                <button onClick={limparEntradaForm} className="w-full rounded-xl bg-slate-100 text-slate-700 px-4 py-3 text-sm font-medium">
+                  Limpar
                 </button>
               </div>
             ) : (
@@ -1314,7 +1399,7 @@ export default function FluxoCaixaApp() {
           <div className="flex items-center justify-between mb-4">
             <div>
               <h3 className="text-lg font-semibold">Listagem de Entradas</h3>
-              <p className="text-sm text-slate-500 mt-1">Visualização apenas de receitas cadastradas.</p>
+              <p className="text-sm text-slate-500 mt-1">Visualização apenas de receitas do período selecionado.</p>
             </div>
             <div className="flex gap-2">
               <button onClick={exportEntradasExcel} className="rounded-2xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50">
@@ -1337,30 +1422,30 @@ export default function FluxoCaixaApp() {
                 </tr>
               </thead>
               <tbody>
-                {[...entradas]
-                  .sort((a, b) => {
-                    const [da, ma, aa] = a.data.split('/').map(Number);
-                    const [db, mb, ab] = b.data.split('/').map(Number);
-                    return new Date(ab, mb - 1, db).getTime() - new Date(aa, ma - 1, da).getTime();
-                  })
-                  .slice(0, 6)
-                  .map((item) => (
-                    <tr
-                      key={item.id}
-                      onClick={() => fillEntradaForm(item)}
-                      className="border-b border-slate-100 hover:bg-slate-50 cursor-pointer"
-                    >
-                      <td className="py-3 pr-3">{item.data}</td>
-                      <td className="py-3 pr-3 font-medium">{item.descricao}</td>
-                      <td className="py-3 pr-3">{item.categoria}</td>
-                      <td className="py-3 pr-3">{formatCurrency(item.valor)}</td>
-                      <td className="py-3 pr-3">
-                        <span className={`inline-flex rounded-full px-3 py-1 text-xs font-medium ${statusClass(item.status || 'Recebido')}`}>
-                          {item.status || 'Recebido'}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
+                {entradasFiltradas.slice(0, 6).map((item) => (
+                  <tr
+                    key={item.id}
+                    onClick={() => fillEntradaForm(item)}
+                    className="border-b border-slate-100 hover:bg-slate-50 cursor-pointer"
+                  >
+                    <td className="py-3 pr-3">{item.data}</td>
+                    <td className="py-3 pr-3 font-medium">{item.descricao}</td>
+                    <td className="py-3 pr-3">{item.categoria}</td>
+                    <td className="py-3 pr-3">{formatCurrency(item.valor)}</td>
+                    <td className="py-3 pr-3">
+                      <span className={`inline-flex rounded-full px-3 py-1 text-xs font-medium ${statusClass(item.status || 'Recebido')}`}>
+                        {item.status || 'Recebido'}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+                {!entradasFiltradas.length && (
+                  <tr>
+                    <td colSpan={5} className="py-8 text-center text-slate-500">
+                      Nenhuma entrada encontrada para o período selecionado.
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
@@ -1370,9 +1455,9 @@ export default function FluxoCaixaApp() {
   );
 
   const saidasResumo = useMemo(() => {
-    const totalSaidas = saidas.reduce((acc, item) => acc + Number(item.valor || 0), 0);
+    const totalSaidas = saidasFiltradas.reduce((acc, item) => acc + Number(item.valor || 0), 0);
 
-    const categoriaContagem = saidas.reduce<Record<string, number>>((acc, item) => {
+    const categoriaContagem = saidasFiltradas.reduce<Record<string, number>>((acc, item) => {
       acc[item.categoria] = (acc[item.categoria] || 0) + 1;
       return acc;
     }, {});
@@ -1382,12 +1467,12 @@ export default function FluxoCaixaApp() {
       ? `${categoriaMaisRecorrenteEntry[0]} • ${categoriaMaisRecorrenteEntry[1]} itens`
       : 'Sem dados';
 
-    const maiorCusto = saidas.length
-      ? saidas.reduce((maior, item) => (Number(item.valor || 0) > Number(maior.valor || 0) ? item : maior), saidas[0])
+    const maiorCusto = saidasFiltradas.length
+      ? saidasFiltradas.reduce((maior, item) => (Number(item.valor || 0) > Number(maior.valor || 0) ? item : maior), saidasFiltradas[0])
       : null;
 
-    const menorCusto = saidas.length
-      ? saidas.reduce((menor, item) => (Number(item.valor || 0) < Number(menor.valor || 0) ? item : menor), saidas[0])
+    const menorCusto = saidasFiltradas.length
+      ? saidasFiltradas.reduce((menor, item) => (Number(item.valor || 0) < Number(menor.valor || 0) ? item : menor), saidasFiltradas[0])
       : null;
 
     return {
@@ -1396,7 +1481,7 @@ export default function FluxoCaixaApp() {
       maiorCusto,
       menorCusto,
     };
-  }, [saidas]);
+  }, [saidasFiltradas]);
 
   const renderSaidas = () => (
     <div>
@@ -1527,12 +1612,15 @@ export default function FluxoCaixaApp() {
               />
             </div>
             {selectedSaidaId ? (
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <button onClick={addSaida} className="w-full rounded-xl bg-slate-900 text-white px-4 py-3 text-sm font-medium">
-                  Atualizar Saída
+                  Atualizar
                 </button>
                 <button onClick={deleteSaida} className="w-full rounded-xl bg-red-600 text-white px-4 py-3 text-sm font-medium">
-                  Excluir Saída
+                  Excluir
+                </button>
+                <button onClick={limparSaidaForm} className="w-full rounded-xl bg-slate-100 text-slate-700 px-4 py-3 text-sm font-medium">
+                  Limpar
                 </button>
               </div>
             ) : (
@@ -1547,7 +1635,7 @@ export default function FluxoCaixaApp() {
           <div className="flex items-center justify-between mb-4">
             <div>
               <h3 className="text-lg font-semibold">Listagem de Saídas</h3>
-              <p className="text-sm text-slate-500 mt-1">Visualização apenas de despesas cadastradas.</p>
+              <p className="text-sm text-slate-500 mt-1">Visualização apenas de despesas do período selecionado.</p>
             </div>
             <div className="flex gap-2">
               <button onClick={exportSaidasExcel} className="rounded-2xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50">
@@ -1571,7 +1659,7 @@ export default function FluxoCaixaApp() {
                 </tr>
               </thead>
               <tbody>
-                {saidas.slice(0, 6).map((item) => (
+                {saidasFiltradas.slice(0, 6).map((item) => (
                   <tr
                     key={item.id}
                     onClick={() => fillSaidaForm(item)}
@@ -1589,6 +1677,13 @@ export default function FluxoCaixaApp() {
                     </td>
                   </tr>
                 ))}
+                {!saidasFiltradas.length && (
+                  <tr>
+                    <td colSpan={6} className="py-8 text-center text-slate-500">
+                      Nenhuma saída encontrada para o período selecionado.
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
@@ -1734,12 +1829,15 @@ export default function FluxoCaixaApp() {
               </div>
             </div>
             {selectedContaId ? (
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <button onClick={addConta} className="w-full rounded-xl bg-amber-500 text-white px-4 py-3 text-sm font-medium">
-                  Atualizar Despesa
+                  Atualizar
                 </button>
                 <button onClick={deleteConta} className="w-full rounded-xl bg-red-600 text-white px-4 py-3 text-sm font-medium">
-                  Excluir Despesa
+                  Excluir
+                </button>
+                <button onClick={limparContaForm} className="w-full rounded-xl bg-slate-100 text-slate-700 px-4 py-3 text-sm font-medium">
+                  Limpar
                 </button>
               </div>
             ) : (
@@ -1754,7 +1852,7 @@ export default function FluxoCaixaApp() {
           <div className="flex items-center justify-between mb-4">
             <div>
               <h3 className="text-lg font-semibold">Listagem de Despesas do Mês</h3>
-              <p className="text-sm text-slate-500 mt-1">Visualização das últimas despesas cadastradas.</p>
+              <p className="text-sm text-slate-500 mt-1">Visualização das despesas do período selecionado.</p>
             </div>
             <div className="flex gap-2">
               <button onClick={exportContasExcel} className="rounded-2xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50">
@@ -1778,7 +1876,7 @@ export default function FluxoCaixaApp() {
                 </tr>
               </thead>
               <tbody>
-                {contasPagar.slice(0, 6).map((item) => (
+                {contasPagarFiltradas.slice(0, 6).map((item) => (
                   <tr
                     key={item.id}
                     onClick={() => fillContaForm(item)}
@@ -1796,6 +1894,13 @@ export default function FluxoCaixaApp() {
                     </td>
                   </tr>
                 ))}
+                {!contasPagarFiltradas.length && (
+                  <tr>
+                    <td colSpan={6} className="py-8 text-center text-slate-500">
+                      Nenhuma despesa encontrada para o período selecionado.
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
@@ -2032,6 +2137,11 @@ export default function FluxoCaixaApp() {
                 <p className="text-slate-600 mt-2 max-w-2xl">
                   Sistema web para controle financeiro com movimentações de entradas, saídas e relatórios.
                 </p>
+                {apiHealth?.status === 'ok' && (
+                  <p className="text-xs text-emerald-600 mt-3">
+                    API online {apiHealth.xlsx_exists === false ? '• arquivo XLSX ainda não encontrado' : '• arquivo XLSX disponível'}
+                  </p>
+                )}
               </div>
             </div>
             <TopActions />
@@ -2040,6 +2150,12 @@ export default function FluxoCaixaApp() {
           {loading && (
             <div className="mb-4 rounded-2xl bg-blue-50 border border-blue-100 px-4 py-3 text-sm text-blue-700">
               Carregando dados da API...
+            </div>
+          )}
+
+          {refreshing && !loading && (
+            <div className="mb-4 rounded-2xl bg-slate-50 border border-slate-200 px-4 py-3 text-sm text-slate-700">
+              Atualizando dados...
             </div>
           )}
 
