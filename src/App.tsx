@@ -85,18 +85,26 @@ type ApiHealth = {
 };
 
 export default function FluxoCaixaApp() {
-  const [activeView, setActiveView] = useState('Dashboard');
-  const [periodo, setPeriodo] = useState('Abril / 2026');
-  const [loading, setLoading] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [apiHealth, setApiHealth] = useState<ApiHealth | null>(null);
-
   const periodOptions = [
     { label: 'Abril / 2026', month: 4, year: 2026, short: 'Abr' },
     { label: 'Março / 2026', month: 3, year: 2026, short: 'Mar' },
     { label: 'Fevereiro / 2026', month: 2, year: 2026, short: 'Fev' },
   ];
+
+  const currentDate = new Date();
+  const currentMonth = currentDate.getMonth() + 1;
+  const currentYear = currentDate.getFullYear();
+
+  const periodoInicial =
+    periodOptions.find((item) => item.month === currentMonth && item.year === currentYear)?.label ||
+    periodOptions[0].label;
+
+  const [activeView, setActiveView] = useState('Dashboard');
+  const [periodo, setPeriodo] = useState(periodoInicial);
+  const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [apiHealth, setApiHealth] = useState<ApiHealth | null>(null);
 
   const selectedPeriod = periodOptions.find((item) => item.label === periodo) || periodOptions[0];
 
@@ -203,11 +211,42 @@ export default function FluxoCaixaApp() {
 
   const parseDate = (value: string) => {
     if (!value || typeof value !== 'string') return null;
-    const parts = value.split('/');
-    if (parts.length !== 3) return null;
-    const [day, month, year] = parts.map(Number);
-    if (!day || !month || !year) return null;
-    return { day, month, year };
+
+    const normalized = value.trim();
+
+    if (normalized.includes('/')) {
+      const parts = normalized.split('/').map(Number);
+
+      if (parts.length === 3) {
+        if (String(parts[0]).length === 4) {
+          const [year, month, day] = parts;
+          if (!day || !month || !year) return null;
+          return { day, month, year };
+        }
+
+        const [day, month, year] = parts;
+        if (!day || !month || !year) return null;
+        return { day, month, year };
+      }
+    }
+
+    if (normalized.includes('-')) {
+      const parts = normalized.split('-').map(Number);
+
+      if (parts.length === 3) {
+        if (String(parts[0]).length === 4) {
+          const [year, month, day] = parts;
+          if (!day || !month || !year) return null;
+          return { day, month, year };
+        }
+
+        const [day, month, year] = parts;
+        if (!day || !month || !year) return null;
+        return { day, month, year };
+      }
+    }
+
+    return null;
   };
 
   const toDate = (value: string) => {
@@ -219,6 +258,7 @@ export default function FluxoCaixaApp() {
   const toDateInputValue = (value: string) => {
     const parsed = parseDate(value);
     if (!parsed) return value;
+
     const day = String(parsed.day).padStart(2, '0');
     const month = String(parsed.month).padStart(2, '0');
     return `${parsed.year}-${month}-${day}`;
@@ -285,16 +325,19 @@ export default function FluxoCaixaApp() {
 
   async function carregarEntradas() {
     const data = await getJSON<Entrada[]>('/entradas');
+    console.log('Entradas vindas da API:', data);
     setEntradas(data);
   }
 
   async function carregarSaidas() {
     const data = await getJSON<SaidaApi[]>('/saidas');
+    console.log('Saídas vindas da API:', data);
     setSaidas(data.map(mapSaidaApiToUI));
   }
 
   async function carregarDespesas() {
     const data = await getJSON<DespesaApi[]>('/despesas');
+    console.log('Despesas vindas da API:', data);
     setContasPagar(data.map(mapDespesaApiToUI));
   }
 
