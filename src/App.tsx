@@ -1,5 +1,14 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Wallet, Landmark, ArrowDownCircle, ArrowUpCircle, CreditCard, BarChart3, RefreshCw } from 'lucide-react';
+import {
+  Wallet,
+  Landmark,
+  ArrowDownCircle,
+  ArrowUpCircle,
+  CreditCard,
+  BarChart3,
+  RefreshCw,
+  AlertTriangle,
+} from 'lucide-react';
 import {
   ComposedChart,
   Bar,
@@ -358,6 +367,8 @@ export default function FluxoCaixaApp() {
       totalCartaoCredito,
     };
   }, [entradasFiltradas, saidasFiltradas, contasPagarFiltradas]);
+
+  const saldoAtualNegativo = totais.saldoAtual < 0;
 
   const fluxoMensalChart = useMemo(() => {
     return periodOptions.map((option) => {
@@ -1118,6 +1129,7 @@ export default function FluxoCaixaApp() {
             <Wallet className="h-10 w-10 text-emerald-300" />
           </div>
         </div>
+
         <div className={`${cardClass} h-full min-h-[170px] flex flex-col justify-between`}>
           <p className="text-sm text-slate-500 leading-snug">Total de Entradas</p>
           <div className="flex items-center justify-between gap-4">
@@ -1125,6 +1137,7 @@ export default function FluxoCaixaApp() {
             <ArrowUpCircle className="h-10 w-10 text-emerald-500" />
           </div>
         </div>
+
         <div className={`${cardClass} h-full min-h-[170px] flex flex-col justify-between`}>
           <p className="text-sm text-slate-500 leading-snug">Total de Saídas</p>
           <div className="flex items-center justify-between gap-4">
@@ -1132,13 +1145,50 @@ export default function FluxoCaixaApp() {
             <ArrowDownCircle className="h-10 w-10 text-rose-500" />
           </div>
         </div>
-        <div className={`${cardClass} h-full min-h-[170px] flex flex-col justify-between`}>
-          <p className="text-sm text-slate-500 leading-snug">Saldo Atual</p>
+
+        <div
+          className={`${cardClass} h-full min-h-[170px] flex flex-col justify-between ${
+            saldoAtualNegativo
+              ? 'bg-gradient-to-br from-red-50 to-rose-100 border-red-200'
+              : ''
+          }`}
+        >
+          <p
+            className={`text-sm leading-snug ${
+              saldoAtualNegativo ? 'text-red-600 font-semibold' : 'text-slate-500'
+            }`}
+          >
+            Saldo Atual
+          </p>
+
           <div className="flex items-center justify-between gap-4">
-            <h3 className="w-full text-[clamp(1.45rem,2.2vw,2rem)] font-bold leading-tight break-words text-blue-600">{formatCurrency(totais.saldoAtual)}</h3>
-            <BarChart3 className="h-10 w-10 text-blue-500" />
+            <div className="w-full">
+              <h3
+                className={`text-[clamp(1.45rem,2.2vw,2rem)] font-bold leading-tight break-words ${
+                  saldoAtualNegativo ? 'text-red-600' : 'text-blue-600'
+                }`}
+              >
+                {formatCurrency(totais.saldoAtual)}
+              </h3>
+
+              {saldoAtualNegativo && (
+                <div className="mt-3 inline-flex items-center gap-2 rounded-full bg-red-100 px-3 py-1 text-xs font-semibold text-red-700 border border-red-200">
+                  <AlertTriangle className="h-4 w-4" />
+                  Saldo negativo
+                </div>
+              )}
+            </div>
+
+            {saldoAtualNegativo ? (
+              <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-red-100 border border-red-200">
+                <AlertTriangle className="h-7 w-7 text-red-600" />
+              </div>
+            ) : (
+              <BarChart3 className="h-10 w-10 text-blue-500" />
+            )}
           </div>
         </div>
+
         <div className={`${cardClass} h-full min-h-[170px] flex flex-col justify-between bg-gradient-to-br from-violet-50 to-indigo-50`}>
           <p className="text-sm text-slate-500 leading-snug">Cartão de Crédito</p>
           <div className="flex items-center justify-between gap-4">
