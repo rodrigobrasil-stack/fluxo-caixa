@@ -86,7 +86,7 @@ class DespesaOut(DespesaIn):
 # =========================
 # APP
 # =========================
-app = FastAPI(title="Fluxo de Caixa API", version="2.3.0")
+app = FastAPI(title="Fluxo de Caixa API", version="2.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -121,7 +121,6 @@ def normalize_service_account_info(info: dict) -> dict:
 
     private_key = private_key.strip()
 
-    # Caso tenha sido colado com \n escapado no Render
     if "\\n" in private_key:
         private_key = private_key.replace("\\n", "\n")
 
@@ -187,19 +186,68 @@ def init_spreadsheet() -> None:
                 ws.append_row(headers)
 
 
+def safe_float(value) -> float:
+    if value in [None, ""]:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+    text = text.replace("R$", "").replace(" ", "")
+
+    # 1.234,56 -> 1234.56
+    if "," in text and "." in text:
+        text = text.replace(".", "").replace(",", ".")
+    else:
+        text = text.replace(",", ".")
+
+    return float(text)
+
+
+def safe_int(value) -> int | None:
+    if value in [None, ""]:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    return int(float(text))
+
+
 def worksheet_rows_as_dicts(sheet_name: str) -> list[dict]:
     sh = get_spreadsheet()
     ws = sh.worksheet(sheet_name)
-    rows = ws.get_all_records()
+    rows = ws.get_all_records(default_blank="")
 
     data: list[dict] = []
-    for row in rows:
-        item = dict(row)
-        if item.get("id") not in [None, ""]:
-            item["id"] = int(item["id"])
-        if item.get("valor") not in [None, ""]:
-            item["valor"] = float(item["valor"])
-        data.append(item)
+    for index, row in enumerate(rows, start=2):
+        try:
+            item = dict(row)
+
+            # Ignora linha totalmente vazia
+            if not any(str(v).strip() for v in item.values()):
+                continue
+
+            if "id" in item:
+                parsed_id = safe_int(item.get("id"))
+                if parsed_id is None:
+                    print(f"[Sheets] Linha {index} ignorada em {sheet_name}: id vazio")
+                    continue
+                item["id"] = parsed_id
+
+            if "valor" in item:
+                item["valor"] = safe_float(item.get("valor"))
+
+            data.append(item)
+        except Exception as exc:
+            print(f"[Sheets] Erro ao processar linha {index} da aba {sheet_name}: {row} | erro: {exc}")
+            raise
+
     return data
 
 
@@ -681,7 +729,14 @@ async def telegram_webhook(request: Request):
 
 @app.get("/api/entradas", response_model=list[EntradaOut])
 def list_entradas():
-    return worksheet_rows_as_dicts("Entradas")
+    try:
+        data = worksheet_rows_as_dicts("Entradas")
+        print(f"[API] /api/entradas retornou {len(data)} registros")
+        return data
+    except Exception as exc:
+        print(f"[API] Erro em /api/entradas: {exc}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Erro ao ler Entradas: {exc}")
 
 
 @app.post("/api/entradas", response_model=EntradaOut)
@@ -701,7 +756,14 @@ def remove_entrada(item_id: int):
 
 @app.get("/api/saidas", response_model=list[SaidaOut])
 def list_saidas():
-    return worksheet_rows_as_dicts("Saidas")
+    try:
+        data = worksheet_rows_as_dicts("Saidas")
+        print(f"[API] /api/saidas retornou {len(data)} registros")
+        return data
+    except Exception as exc:
+        print(f"[API] Erro em /api/saidas: {exc}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Erro ao ler Saidas: {exc}")
 
 
 @app.post("/api/saidas", response_model=SaidaOut)
@@ -721,7 +783,14 @@ def remove_saida(item_id: int):
 
 @app.get("/api/despesas", response_model=list[DespesaOut])
 def list_despesas():
-    return worksheet_rows_as_dicts("DespesasMes")
+    try:
+        data = worksheet_rows_as_dicts("DespesasMes")
+        print(f"[API] /api/despesas retornou {len(data)} registros")
+        return data
+    except Exception as exc:
+        print(f"[API] Erro em /api/despesas: {exc}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Erro ao ler DespesasMes: {exc}")
 
 
 @app.post("/api/despesas", response_model=DespesaOut)
