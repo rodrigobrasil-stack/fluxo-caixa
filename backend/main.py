@@ -41,7 +41,6 @@ cors_origins_env = os.getenv(
 
 ALLOWED_ORIGINS = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
 
-
 # =========================
 # MODELOS
 # =========================
@@ -86,7 +85,7 @@ class DespesaOut(DespesaIn):
 # =========================
 # APP
 # =========================
-app = FastAPI(title="Fluxo de Caixa API", version="2.5.0")
+app = FastAPI(title="Fluxo de Caixa API", version="2.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -95,7 +94,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # =========================
 # GOOGLE SHEETS
@@ -171,6 +169,25 @@ def get_spreadsheet():
         ) from exc
 
 
+def ensure_headers(sheet_name: str) -> None:
+    sh = get_spreadsheet()
+    ws = sh.worksheet(sheet_name)
+    expected_headers = SHEETS[sheet_name]
+    values = ws.get_all_values()
+
+    if not values:
+        ws.append_row(expected_headers)
+        print(f"[Sheets] Cabeçalhos criados em {sheet_name}: {expected_headers}")
+        return
+
+    first_row = values[0]
+    normalized_first_row = [str(v).strip() for v in first_row[:len(expected_headers)]]
+
+    if normalized_first_row != expected_headers:
+        ws.update(f"A1:{chr(64 + len(expected_headers))}1", [expected_headers])
+        print(f"[Sheets] Cabeçalhos ajustados em {sheet_name}: {expected_headers}")
+
+
 def init_spreadsheet() -> None:
     sh = get_spreadsheet()
     existing = {ws.title for ws in sh.worksheets()}
@@ -179,11 +196,9 @@ def init_spreadsheet() -> None:
         if sheet_name not in existing:
             ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=len(headers))
             ws.append_row(headers)
+            print(f"[Sheets] Aba criada: {sheet_name}")
         else:
-            ws = sh.worksheet(sheet_name)
-            values = ws.get_all_values()
-            if not values:
-                ws.append_row(headers)
+            ensure_headers(sheet_name)
 
 
 def safe_float(value) -> float:
@@ -200,7 +215,10 @@ def safe_float(value) -> float:
     else:
         text = text.replace(",", ".")
 
-    return float(text)
+    try:
+        return float(text)
+    except Exception:
+        return 0.0
 
 
 def safe_int(value) -> int | None:
@@ -215,7 +233,10 @@ def safe_int(value) -> int | None:
     if not text:
         return None
 
-    return int(float(text))
+    try:
+        return int(float(text))
+    except Exception:
+        return None
 
 
 def sanitize_text(value: object, default: str = "") -> str:
@@ -264,27 +285,52 @@ def normalize_despesa_item(item: dict) -> dict:
     }
 
 
+def normalize_header_name(value: str) -> str:
+    value = (value or "").strip().lower()
+    value = "".join(
+        c for c in unicodedata.normalize("NFD", value)
+        if unicodedata.category(c) != "Mn"
+    )
+    value = re.sub(r"\s+", "_", value)
+    return value
+
+
 def worksheet_rows_as_dicts(sheet_name: str) -> list[dict]:
     sh = get_spreadsheet()
     ws = sh.worksheet(sheet_name)
-    rows = ws.get_all_records(default_blank="")
+    values = ws.get_all_values()
+
+    if not values:
+        print(f"[Sheets] Aba {sheet_name} vazia")
+        return []
+
+    raw_headers = values[0]
+    normalized_headers = [normalize_header_name(h) for h in raw_headers]
+    expected_headers = SHEETS[sheet_name]
+
+    print(f"[Sheets] Aba {sheet_name} | headers brutos: {raw_headers}")
+    print(f"[Sheets] Aba {sheet_name} | headers normalizados: {normalized_headers}")
+    print(f"[Sheets] Aba {sheet_name} | headers esperados: {expected_headers}")
 
     data: list[dict] = []
-    expected_headers = set(SHEETS[sheet_name])
 
-    for index, row in enumerate(rows, start=2):
+    for index, line in enumerate(values[1:], start=2):
         try:
-            raw = dict(row)
-
-            if not any(str(v).strip() for v in raw.values()):
+            if not any(str(v).strip() for v in line):
                 continue
 
-            item = {key: raw.get(key, "") for key in expected_headers}
+            row = {}
+            for i, header in enumerate(normalized_headers):
+                if header:
+                    row[header] = line[i] if i < len(line) else ""
+
+            item = {key: row.get(key, "") for key in expected_headers}
 
             parsed_id = safe_int(item.get("id"))
             if parsed_id is None:
-                print(f"[Sheets] Linha {index} ignorada em {sheet_name}: id vazio ou inválido")
+                print(f"[Sheets] Linha {index} ignorada em {sheet_name}: id vazio ou inválido | row={row}")
                 continue
+
             item["id"] = parsed_id
 
             if sheet_name == "Entradas":
@@ -296,17 +342,22 @@ def worksheet_rows_as_dicts(sheet_name: str) -> list[dict]:
 
             data.append(item)
         except Exception as exc:
-            print(f"[Sheets] Linha inválida ignorada em {sheet_name} (linha {index}): {row} | erro: {exc}")
+            print(f"[Sheets] Linha inválida ignorada em {sheet_name} (linha {index}): {line} | erro: {exc}")
             continue
 
+    print(f"[Sheets] Aba {sheet_name} | total lido: {len(data)}")
     return data
 
 
 def next_id(sheet_name: str) -> int:
     items = worksheet_rows_as_dicts(sheet_name)
-    if not items:
+    ids = [safe_int(item.get("id")) for item in items]
+    ids_validos = [i for i in ids if i is not None]
+
+    if not ids_validos:
         return 1
-    return max(int(item["id"]) for item in items) + 1
+
+    return max(ids_validos) + 1
 
 
 def append_row(sheet_name: str, row: dict) -> dict:
@@ -316,6 +367,7 @@ def append_row(sheet_name: str, row: dict) -> dict:
     row_id = next_id(sheet_name)
     payload = {"id": row_id, **row}
     ws.append_row([payload.get(col) for col in headers], value_input_option="USER_ENTERED")
+    print(f"[Sheets] append_row em {sheet_name}: {payload}")
     return payload
 
 
@@ -328,10 +380,11 @@ def update_row(sheet_name: str, item_id: int, row: dict) -> dict:
     end_col = chr(64 + len(headers))
 
     for idx, line in enumerate(values[1:], start=2):
-        current_id = line[0]
-        if str(current_id) == str(item_id):
+        current_id = line[0] if line else ""
+        if str(current_id).strip() == str(item_id):
             payload = {"id": item_id, **row}
             ws.update(f"A{idx}:{end_col}{idx}", [[payload.get(h) for h in headers]])
+            print(f"[Sheets] update_row em {sheet_name}: {payload}")
             return payload
 
     raise HTTPException(status_code=404, detail=f"Item {item_id} não encontrado em {sheet_name}.")
@@ -343,13 +396,13 @@ def delete_row(sheet_name: str, item_id: int) -> dict:
     values = ws.get_all_values()
 
     for idx, line in enumerate(values[1:], start=2):
-        current_id = line[0]
-        if str(current_id) == str(item_id):
+        current_id = line[0] if line else ""
+        if str(current_id).strip() == str(item_id):
             ws.delete_rows(idx)
+            print(f"[Sheets] delete_row em {sheet_name}: id={item_id}")
             return {"success": True, "id": item_id}
 
     raise HTTPException(status_code=404, detail=f"Item {item_id} não encontrado em {sheet_name}.")
-
 
 # =========================
 # HELPERS
@@ -415,7 +468,6 @@ def calcular_resumo() -> dict:
         "total_saidas": total_saidas_base + total_despesas_pagas,
         "total_cartao_credito": total_cartao,
     }
-
 
 # =========================
 # TELEGRAM
@@ -702,7 +754,6 @@ def processar_update(update: dict) -> None:
         print(traceback.format_exc())
         telegram_send_message(chat_id, f"❌ Erro ao processar mensagem: {exc}")
 
-
 # =========================
 # STARTUP
 # =========================
@@ -724,7 +775,6 @@ def startup_event():
         telegram_set_webhook()
     else:
         print("[Telegram] Token não configurado.")
-
 
 # =========================
 # ROTAS
@@ -761,6 +811,21 @@ def debug_google_sheets():
             "ok": True,
             "spreadsheet_id": SPREADSHEET_ID,
             "worksheets": worksheets,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/debug/saidas/raw")
+def debug_saidas_raw():
+    try:
+        sh = get_spreadsheet()
+        ws = sh.worksheet("Saidas")
+        values = ws.get_all_values()
+        return {
+            "title": ws.title,
+            "rows": values[:20],
+            "total_rows": len(values),
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
