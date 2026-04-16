@@ -1,55 +1,48 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Literal
-from threading import Thread, RLock
 from datetime import datetime
-import time
 import re
 import unicodedata
 import os
+import json
 
 import requests
-from fastapi import FastAPI, HTTPException
+import gspread
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from openpyxl import Workbook, load_workbook
+from google.oauth2.service_account import Credentials
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "dados"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-XLSX_PATH = DATA_DIR / "dados_fluxo_caixa.xlsx"
-
+# =========================
+# CONFIG
+# =========================
 SHEETS = {
     "Entradas": ["id", "data", "descricao", "categoria", "valor", "status"],
     "Saidas": ["id", "data", "descricao", "categoria", "forma_pagamento", "valor", "status"],
     "DespesasMes": ["id", "conta_mes", "descricao", "vencimento", "forma_pagamento", "valor", "status"],
 }
 
-# =========================
-# VARIÁVEIS DE AMBIENTE
-# =========================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_ALLOWED_CHAT_ID = os.getenv("TELEGRAM_ALLOWED_CHAT_ID", "").strip()
-
-# Exemplo:
-# BACKEND_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,https://SEU_USUARIO.github.io
-cors_origins_env = os.getenv(
-    "BACKEND_CORS_ORIGINS",
-    "http://localhost:5173,http://127.0.0.1:5173"
-).strip()
-
-ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in cors_origins_env.split(",")
-    if origin.strip()
-]
+TELEGRAM_WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}" if TELEGRAM_BOT_TOKEN else ""
-telegram_offset = 0
-workbook_lock = RLock()
 
+SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip()
+GOOGLE_SHEETS_CREDENTIALS_JSON = os.getenv("GOOGLE_SHEETS_CREDENTIALS_JSON", "").strip()
 
+cors_origins_env = os.getenv(
+    "BACKEND_CORS_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173,https://rodrigobrasil-stack.github.io"
+).strip()
+
+ALLOWED_ORIGINS = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
+
+# =========================
+# MODELOS
+# =========================
 class EntradaIn(BaseModel):
     data: str
     descricao: str = Field(min_length=1)
@@ -88,10 +81,11 @@ class DespesaOut(DespesaIn):
     id: int
 
 
-app = FastAPI(title="Fluxo de Caixa API", version="1.3.0")
+# =========================
+# APP
+# =========================
+app = FastAPI(title="Fluxo de Caixa API", version="2.1.0")
 
-# IMPORTANTE:
-# se usar allow_credentials=True, não use allow_origins=["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["http://localhost:5173"],
@@ -101,129 +95,112 @@ app.add_middleware(
 )
 
 
-def init_workbook() -> None:
-    with workbook_lock:
-        if XLSX_PATH.exists():
-            wb = load_workbook(XLSX_PATH)
-            changed = False
+# =========================
+# GOOGLE SHEETS
+# =========================
+def get_gspread_client():
+    if not GOOGLE_SHEETS_CREDENTIALS_JSON:
+        raise RuntimeError("GOOGLE_SHEETS_CREDENTIALS_JSON não configurado.")
 
-            for sheet_name, headers in SHEETS.items():
-                if sheet_name not in wb.sheetnames:
-                    ws = wb.create_sheet(title=sheet_name)
-                    ws.append(headers)
-                    changed = True
-
-            if changed:
-                wb.save(XLSX_PATH)
-
-            wb.close()
-            return
-
-        wb = Workbook()
-        default = wb.active
-        wb.remove(default)
-
-        for sheet_name, headers in SHEETS.items():
-            ws = wb.create_sheet(title=sheet_name)
-            ws.append(headers)
-
-        wb.save(XLSX_PATH)
-        wb.close()
+    info = json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON)
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    credentials = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(credentials)
 
 
-def get_workbook():
-    init_workbook()
-    return load_workbook(XLSX_PATH)
+def get_spreadsheet():
+    if not SPREADSHEET_ID:
+        raise RuntimeError("GOOGLE_SHEETS_SPREADSHEET_ID não configurado.")
+    client = get_gspread_client()
+    return client.open_by_key(SPREADSHEET_ID)
 
 
-def rows_as_dicts(sheet_name: str) -> list[dict]:
-    with workbook_lock:
-        wb = get_workbook()
-        ws = wb[sheet_name]
-        rows = list(ws.iter_rows(values_only=True))
-        wb.close()
+def init_spreadsheet() -> None:
+    sh = get_spreadsheet()
+    existing = {ws.title for ws in sh.worksheets()}
 
-    if not rows:
-        return []
+    for sheet_name, headers in SHEETS.items():
+        if sheet_name not in existing:
+            ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=len(headers))
+            ws.append_row(headers)
+        else:
+            ws = sh.worksheet(sheet_name)
+            values = ws.get_all_values()
+            if not values:
+                ws.append_row(headers)
 
-    headers = list(rows[0])
+
+def worksheet_rows_as_dicts(sheet_name: str) -> list[dict]:
+    sh = get_spreadsheet()
+    ws = sh.worksheet(sheet_name)
+    rows = ws.get_all_records()
+
     data: list[dict] = []
-
-    for row in rows[1:]:
-        if row and any(cell is not None for cell in row):
-            item = {headers[idx]: row[idx] for idx in range(len(headers))}
-            if item.get("id") is not None:
-                item["id"] = int(item["id"])
-            if item.get("valor") is not None:
-                item["valor"] = float(item["valor"])
-            data.append(item)
-
+    for row in rows:
+        item = dict(row)
+        if item.get("id") not in [None, ""]:
+            item["id"] = int(item["id"])
+        if item.get("valor") not in [None, ""]:
+            item["valor"] = float(item["valor"])
+        data.append(item)
     return data
 
 
 def next_id(sheet_name: str) -> int:
-    items = rows_as_dicts(sheet_name)
+    items = worksheet_rows_as_dicts(sheet_name)
     if not items:
         return 1
     return max(int(item["id"]) for item in items) + 1
 
 
 def append_row(sheet_name: str, row: dict) -> dict:
-    with workbook_lock:
-        print(f"[Excel] append_row iniciado em {sheet_name}")
-        wb = get_workbook()
-        ws = wb[sheet_name]
-        headers = SHEETS[sheet_name]
-        row_id = next_id(sheet_name)
-        payload = {"id": row_id, **row}
-
-        ws.append([payload.get(col) for col in headers])
-        wb.save(XLSX_PATH)
-        wb.close()
-
-        print(f"[Excel] append_row finalizado em {sheet_name}: {payload}")
-        return payload
+    sh = get_spreadsheet()
+    ws = sh.worksheet(sheet_name)
+    headers = SHEETS[sheet_name]
+    row_id = next_id(sheet_name)
+    payload = {"id": row_id, **row}
+    ws.append_row([payload.get(col) for col in headers], value_input_option="USER_ENTERED")
+    return payload
 
 
 def update_row(sheet_name: str, item_id: int, row: dict) -> dict:
-    with workbook_lock:
-        wb = get_workbook()
-        ws = wb[sheet_name]
-        headers = SHEETS[sheet_name]
+    sh = get_spreadsheet()
+    ws = sh.worksheet(sheet_name)
+    headers = SHEETS[sheet_name]
+    values = ws.get_all_values()
 
-        for excel_row in range(2, ws.max_row + 1):
-            current_id = ws.cell(excel_row, 1).value
-            if current_id == item_id:
-                payload = {"id": item_id, **row}
-                for col_idx, header in enumerate(headers, start=1):
-                    ws.cell(excel_row, col_idx).value = payload.get(header)
-                wb.save(XLSX_PATH)
-                wb.close()
-                return payload
+    end_col = chr(64 + len(headers))
 
-        wb.close()
+    for idx, line in enumerate(values[1:], start=2):
+        current_id = line[0]
+        if str(current_id) == str(item_id):
+            payload = {"id": item_id, **row}
+            ws.update(f"A{idx}:{end_col}{idx}", [[payload.get(h) for h in headers]])
+            return payload
 
     raise HTTPException(status_code=404, detail=f"Item {item_id} não encontrado em {sheet_name}.")
 
 
 def delete_row(sheet_name: str, item_id: int) -> dict:
-    with workbook_lock:
-        wb = get_workbook()
-        ws = wb[sheet_name]
+    sh = get_spreadsheet()
+    ws = sh.worksheet(sheet_name)
+    values = ws.get_all_values()
 
-        for excel_row in range(2, ws.max_row + 1):
-            current_id = ws.cell(excel_row, 1).value
-            if current_id == item_id:
-                ws.delete_rows(excel_row, 1)
-                wb.save(XLSX_PATH)
-                wb.close()
-                return {"success": True, "id": item_id}
-
-        wb.close()
+    for idx, line in enumerate(values[1:], start=2):
+        current_id = line[0]
+        if str(current_id) == str(item_id):
+            ws.delete_rows(idx)
+            return {"success": True, "id": item_id}
 
     raise HTTPException(status_code=404, detail=f"Item {item_id} não encontrado em {sheet_name}.")
 
 
+# =========================
+# HELPERS
+# =========================
 def format_currency(value: float) -> str:
     inteiro, decimal = f"{value:.2f}".split(".")
     inteiro = f"{int(inteiro):,}".replace(",", ".")
@@ -252,9 +229,9 @@ def normalize_text(texto: str) -> str:
 
 
 def calcular_resumo() -> dict:
-    entradas = rows_as_dicts("Entradas")
-    saidas = rows_as_dicts("Saidas")
-    despesas = rows_as_dicts("DespesasMes")
+    entradas = worksheet_rows_as_dicts("Entradas")
+    saidas = worksheet_rows_as_dicts("Saidas")
+    despesas = worksheet_rows_as_dicts("DespesasMes")
 
     total_entradas = sum(float(item.get("valor", 0) or 0) for item in entradas)
 
@@ -287,10 +264,12 @@ def calcular_resumo() -> dict:
     }
 
 
+# =========================
+# TELEGRAM
+# =========================
 def telegram_send_message(chat_id: str, text: str) -> None:
     if not TELEGRAM_API_URL:
         return
-
     try:
         response = requests.post(
             f"{TELEGRAM_API_URL}/sendMessage",
@@ -302,21 +281,9 @@ def telegram_send_message(chat_id: str, text: str) -> None:
         print(f"[Telegram] Erro ao enviar mensagem: {exc}")
 
 
-def telegram_delete_webhook():
-    if not TELEGRAM_API_URL:
-        return
-
-    try:
-        r = requests.get(f"{TELEGRAM_API_URL}/deleteWebhook", timeout=20)
-        print(f"[Telegram] deleteWebhook => {r.status_code} | {r.text}")
-    except Exception as exc:
-        print(f"[Telegram] Erro ao remover webhook: {exc}")
-
-
 def telegram_get_me():
     if not TELEGRAM_API_URL:
         return
-
     try:
         r = requests.get(f"{TELEGRAM_API_URL}/getMe", timeout=20)
         print(f"[Telegram] getMe => {r.status_code} | {r.text}")
@@ -324,25 +291,28 @@ def telegram_get_me():
         print(f"[Telegram] Erro no getMe: {exc}")
 
 
-def telegram_get_updates(offset: int = 0) -> list[dict]:
-    if not TELEGRAM_API_URL:
-        return []
+def telegram_set_webhook():
+    if not TELEGRAM_API_URL or not TELEGRAM_WEBHOOK_URL:
+        print("[Telegram] Webhook não configurado.")
+        return
+
+    payload = {
+        "url": TELEGRAM_WEBHOOK_URL,
+        "drop_pending_updates": False,
+    }
+
+    if TELEGRAM_WEBHOOK_SECRET:
+        payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
 
     try:
-        response = requests.get(
-            f"{TELEGRAM_API_URL}/getUpdates",
-            params={
-                "timeout": 25,
-                "offset": offset,
-            },
-            timeout=35,
+        response = requests.post(
+            f"{TELEGRAM_API_URL}/setWebhook",
+            json=payload,
+            timeout=20,
         )
-        response.raise_for_status()
-        data = response.json()
-        return data.get("result", [])
+        print(f"[Telegram] setWebhook => {response.status_code} | {response.text}")
     except Exception as exc:
-        print(f"[Telegram] Erro ao consultar updates: {exc}")
-        return []
+        print(f"[Telegram] Erro ao configurar webhook: {exc}")
 
 
 def interpretar_mensagem(texto: str) -> dict:
@@ -366,7 +336,6 @@ def interpretar_mensagem(texto: str) -> dict:
     if m:
         valor = parse_valor(m.group(1))
         resto = m.group(2).strip()
-
         partes = resto.split(" ", 1)
         categoria = partes[0].title()
         descricao = partes[1].strip() if len(partes) > 1 else categoria
@@ -482,53 +451,32 @@ def processar_update(update: dict) -> None:
     message = update.get("message") or {}
     chat = message.get("chat") or {}
     chat_id = str(chat.get("id", "")).strip()
-    chat_type = str(chat.get("type", "")).strip()
-    first_name = message.get("from", {}).get("first_name", "")
-    username = message.get("from", {}).get("username", "")
     texto = message.get("text", "")
 
     if not chat_id:
         return
-
-    print("=" * 90)
-    print("[Telegram] Nova mensagem recebida")
-    print(f"[Telegram] chat_id   : {chat_id}")
-    print(f"[Telegram] chat_type : {chat_type}")
-    print(f"[Telegram] first_name: {first_name}")
-    print(f"[Telegram] username  : {username}")
-    print(f"[Telegram] texto     : {texto}")
-    print("=" * 90)
 
     if TELEGRAM_ALLOWED_CHAT_ID and chat_id != TELEGRAM_ALLOWED_CHAT_ID:
         telegram_send_message(chat_id, "Este chat não está autorizado para lançar dados.")
         return
 
     acao = interpretar_mensagem(texto)
-    print(f"[Telegram] Ação interpretada: {acao}")
 
     try:
         if acao["tipo"] == "entrada":
-            print(f"[Telegram] Processando entrada. Payload: {acao['payload']}")
             item = append_row("Entradas", acao["payload"])
-            print(f"[Telegram] Entrada salva no Excel: {item}")
-
             telegram_send_message(
                 chat_id,
                 "✅ Entrada registrada com sucesso\n\n"
                 f"ID: {item['id']}\n"
-                f"Data: {item['data']}\n"
                 f"Categoria: {item['categoria']}\n"
                 f"Descrição: {item['descricao']}\n"
                 f"Valor: {format_currency(float(item['valor']))}"
             )
-            print(f"[Telegram] Resposta enviada ao chat_id={chat_id}")
             return
 
         if acao["tipo"] == "saida":
-            print(f"[Telegram] Processando saída. Payload: {acao['payload']}")
             item = append_row("Saidas", acao["payload"])
-            print(f"[Telegram] Saída salva no Excel: {item}")
-
             aviso = ""
             if str(item["forma_pagamento"]).strip().lower() in ["cartão de crédito", "cartao de credito"]:
                 aviso = "\n\nℹ️ Registrado apenas como cartão de crédito. Não debita do saldo atual."
@@ -537,20 +485,15 @@ def processar_update(update: dict) -> None:
                 chat_id,
                 "✅ Saída registrada com sucesso\n\n"
                 f"ID: {item['id']}\n"
-                f"Data: {item['data']}\n"
                 f"Forma: {item['forma_pagamento']}\n"
                 f"Descrição: {item['descricao']}\n"
                 f"Valor: {format_currency(float(item['valor']))}"
                 f"{aviso}"
             )
-            print(f"[Telegram] Resposta enviada ao chat_id={chat_id}")
             return
 
         if acao["tipo"] == "despesa":
-            print(f"[Telegram] Processando despesa. Payload: {acao['payload']}")
             item = append_row("DespesasMes", acao["payload"])
-            print(f"[Telegram] Despesa salva no Excel: {item}")
-
             telegram_send_message(
                 chat_id,
                 "✅ Despesa registrada com sucesso\n\n"
@@ -561,14 +504,10 @@ def processar_update(update: dict) -> None:
                 f"Descrição: {item['descricao']}\n"
                 f"Valor: {format_currency(float(item['valor']))}"
             )
-            print(f"[Telegram] Resposta enviada ao chat_id={chat_id}")
             return
 
         if acao["tipo"] == "saldo":
-            print("[Telegram] Processando comando saldo")
             resumo = calcular_resumo()
-            print(f"[Telegram] Resumo calculado: {resumo}")
-
             telegram_send_message(
                 chat_id,
                 "💰 Saldo atual\n\n"
@@ -577,14 +516,10 @@ def processar_update(update: dict) -> None:
                 f"Cartão de Crédito: {format_currency(resumo['total_cartao_credito'])}\n"
                 f"Saldo Atual: {format_currency(resumo['saldo_atual'])}"
             )
-            print(f"[Telegram] Resposta enviada ao chat_id={chat_id}")
             return
 
         if acao["tipo"] == "resumo":
-            print("[Telegram] Processando comando resumo")
             resumo = calcular_resumo()
-            print(f"[Telegram] Resumo calculado: {resumo}")
-
             telegram_send_message(
                 chat_id,
                 "📊 Resumo financeiro\n\n"
@@ -593,7 +528,6 @@ def processar_update(update: dict) -> None:
                 f"Cartão de Crédito: {format_currency(resumo['total_cartao_credito'])}\n"
                 f"Saldo Atual: {format_currency(resumo['saldo_atual'])}"
             )
-            print(f"[Telegram] Resposta enviada ao chat_id={chat_id}")
             return
 
         telegram_send_message(
@@ -601,66 +535,36 @@ def processar_update(update: dict) -> None:
             "Comandos disponíveis:\n\n"
             "1) entrada 2500 salario Recebimento cliente\n"
             "2) saida 89,90 pix internet\n"
-            "3) saída 350 cartao de credito combustivel\n"
-            "4) despesa 1200 boleto aluguel 20/04/2026\n"
-            "5) despesa 3000 pix cartao nubank camila pago\n"
-            "6) saldo\n"
-            "7) resumo"
+            "3) despesa 1200 boleto aluguel 20/04/2026\n"
+            "4) despesa 3000 pix cartao nubank camila pago\n"
+            "5) saldo\n"
+            "6) resumo"
         )
-        print("[Telegram] Ajuda enviada")
 
     except Exception as exc:
         print(f"[Telegram] Erro no processamento: {exc}")
         telegram_send_message(chat_id, f"❌ Erro ao processar mensagem: {exc}")
 
 
-def telegram_polling_loop():
-    global telegram_offset
-
-    print("[Telegram] Polling iniciado com getUpdates.")
-
-    while True:
-        try:
-            updates = telegram_get_updates(telegram_offset)
-
-            for update in updates:
-                telegram_offset = update["update_id"] + 1
-                processar_update(update)
-
-        except Exception as exc:
-            print(f"[Telegram] Falha no loop principal: {exc}")
-
-        time.sleep(2)
-
-
+# =========================
+# STARTUP
+# =========================
 @app.on_event("startup")
 def startup_event():
-    init_workbook()
-    print(f"[API] XLSX_PATH = {XLSX_PATH}")
+    init_spreadsheet()
+    print(f"[API] Google Sheets conectado. Spreadsheet ID = {SPREADSHEET_ID}")
     print(f"[API] ALLOWED_ORIGINS = {ALLOWED_ORIGINS}")
 
     if TELEGRAM_BOT_TOKEN:
         telegram_get_me()
-        telegram_delete_webhook()
-
-        t = Thread(target=telegram_polling_loop, daemon=True)
-        t.start()
+        telegram_set_webhook()
     else:
         print("[Telegram] Token não configurado.")
 
 
-@app.get("/api/health")
-def health_check():
-    return {
-        "status": "ok",
-        "xlsx": str(XLSX_PATH),
-        "xlsx_exists": XLSX_PATH.exists(),
-        "telegram": "ativo" if TELEGRAM_BOT_TOKEN else "desativado",
-        "allowed_chat_id": TELEGRAM_ALLOWED_CHAT_ID or "não definido",
-        "allowed_origins": ALLOWED_ORIGINS,
-    }
-
-
+# =========================
+# ROTAS
+# =========================
 @app.get("/")
 def root():
     return {
@@ -670,9 +574,33 @@ def root():
     }
 
 
+@app.get("/api/health")
+def health_check():
+    return {
+        "status": "ok",
+        "storage": "google_sheets",
+        "spreadsheet_id": SPREADSHEET_ID,
+        "telegram": "ativo" if TELEGRAM_BOT_TOKEN else "desativado",
+        "allowed_origins": ALLOWED_ORIGINS,
+        "webhook_url": TELEGRAM_WEBHOOK_URL or "não definido",
+    }
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    if TELEGRAM_WEBHOOK_SECRET:
+        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if header_secret != TELEGRAM_WEBHOOK_SECRET:
+            raise HTTPException(status_code=403, detail="Webhook do Telegram não autorizado.")
+
+    update = await request.json()
+    processar_update(update)
+    return {"ok": True}
+
+
 @app.get("/api/entradas", response_model=list[EntradaOut])
 def list_entradas():
-    return rows_as_dicts("Entradas")
+    return worksheet_rows_as_dicts("Entradas")
 
 
 @app.post("/api/entradas", response_model=EntradaOut)
@@ -692,7 +620,7 @@ def remove_entrada(item_id: int):
 
 @app.get("/api/saidas", response_model=list[SaidaOut])
 def list_saidas():
-    return rows_as_dicts("Saidas")
+    return worksheet_rows_as_dicts("Saidas")
 
 
 @app.post("/api/saidas", response_model=SaidaOut)
@@ -712,7 +640,7 @@ def remove_saida(item_id: int):
 
 @app.get("/api/despesas", response_model=list[DespesaOut])
 def list_despesas():
-    return rows_as_dicts("DespesasMes")
+    return worksheet_rows_as_dicts("DespesasMes")
 
 
 @app.post("/api/despesas", response_model=DespesaOut)
