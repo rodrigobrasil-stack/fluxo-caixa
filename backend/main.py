@@ -86,7 +86,7 @@ class DespesaOut(DespesaIn):
 # =========================
 # APP
 # =========================
-app = FastAPI(title="Fluxo de Caixa API", version="2.4.0")
+app = FastAPI(title="Fluxo de Caixa API", version="2.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -218,33 +218,86 @@ def safe_int(value) -> int | None:
     return int(float(text))
 
 
+def sanitize_text(value: object, default: str = "") -> str:
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def normalize_saida_item(item: dict) -> dict:
+    return {
+        "id": safe_int(item.get("id")) or 0,
+        "data": sanitize_text(item.get("data")),
+        "descricao": sanitize_text(item.get("descricao"), "Sem descrição"),
+        "categoria": sanitize_text(item.get("categoria"), "Outros"),
+        "forma_pagamento": sanitize_text(item.get("forma_pagamento"), "PIX"),
+        "valor": safe_float(item.get("valor")),
+        "status": sanitize_text(item.get("status"), "Pago"),
+    }
+
+
+def normalize_entrada_item(item: dict) -> dict:
+    return {
+        "id": safe_int(item.get("id")) or 0,
+        "data": sanitize_text(item.get("data")),
+        "descricao": sanitize_text(item.get("descricao"), "Sem descrição"),
+        "categoria": sanitize_text(item.get("categoria"), "Outros"),
+        "valor": safe_float(item.get("valor")),
+        "status": sanitize_text(item.get("status"), "Recebido"),
+    }
+
+
+def normalize_despesa_item(item: dict) -> dict:
+    status = sanitize_text(item.get("status"), "Pendente")
+    if status not in ["Pendente", "Pago", "Vencido"]:
+        status = "Pendente"
+
+    return {
+        "id": safe_int(item.get("id")) or 0,
+        "conta_mes": sanitize_text(item.get("conta_mes"), "Outros"),
+        "descricao": sanitize_text(item.get("descricao"), "Sem descrição"),
+        "vencimento": sanitize_text(item.get("vencimento")),
+        "forma_pagamento": sanitize_text(item.get("forma_pagamento"), "PIX"),
+        "valor": safe_float(item.get("valor")),
+        "status": status,
+    }
+
+
 def worksheet_rows_as_dicts(sheet_name: str) -> list[dict]:
     sh = get_spreadsheet()
     ws = sh.worksheet(sheet_name)
     rows = ws.get_all_records(default_blank="")
 
     data: list[dict] = []
+    expected_headers = set(SHEETS[sheet_name])
+
     for index, row in enumerate(rows, start=2):
         try:
-            item = dict(row)
+            raw = dict(row)
 
-            if not any(str(v).strip() for v in item.values()):
+            if not any(str(v).strip() for v in raw.values()):
                 continue
 
-            if "id" in item:
-                parsed_id = safe_int(item.get("id"))
-                if parsed_id is None:
-                    print(f"[Sheets] Linha {index} ignorada em {sheet_name}: id vazio")
-                    continue
-                item["id"] = parsed_id
+            item = {key: raw.get(key, "") for key in expected_headers}
 
-            if "valor" in item:
-                item["valor"] = safe_float(item.get("valor"))
+            parsed_id = safe_int(item.get("id"))
+            if parsed_id is None:
+                print(f"[Sheets] Linha {index} ignorada em {sheet_name}: id vazio ou inválido")
+                continue
+            item["id"] = parsed_id
+
+            if sheet_name == "Entradas":
+                item = normalize_entrada_item(item)
+            elif sheet_name == "Saidas":
+                item = normalize_saida_item(item)
+            elif sheet_name == "DespesasMes":
+                item = normalize_despesa_item(item)
 
             data.append(item)
         except Exception as exc:
-            print(f"[Sheets] Erro ao processar linha {index} da aba {sheet_name}: {row} | erro: {exc}")
-            raise
+            print(f"[Sheets] Linha inválida ignorada em {sheet_name} (linha {index}): {row} | erro: {exc}")
+            continue
 
     return data
 
