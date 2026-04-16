@@ -86,7 +86,7 @@ class DespesaOut(DespesaIn):
 # =========================
 # APP
 # =========================
-app = FastAPI(title="Fluxo de Caixa API", version="2.2.0")
+app = FastAPI(title="Fluxo de Caixa API", version="2.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -110,9 +110,23 @@ def validate_required_settings() -> None:
         missing.append("GOOGLE_SHEETS_SPREADSHEET_ID")
 
     if missing:
-        raise RuntimeError(
-            "Variáveis obrigatórias não configuradas: " + ", ".join(missing)
-        )
+        raise RuntimeError("Variáveis obrigatórias não configuradas: " + ", ".join(missing))
+
+
+def normalize_service_account_info(info: dict) -> dict:
+    private_key = info.get("private_key", "")
+
+    if not private_key:
+        raise RuntimeError("Campo 'private_key' ausente ou vazio no JSON da service account.")
+
+    private_key = private_key.strip()
+
+    # Caso tenha sido colado com \n escapado no Render
+    if "\\n" in private_key:
+        private_key = private_key.replace("\\n", "\n")
+
+    info["private_key"] = private_key
+    return info
 
 
 def get_gspread_client():
@@ -129,6 +143,8 @@ def get_gspread_client():
         raise RuntimeError(
             "JSON da service account incompleto. Campos ausentes: " + ", ".join(missing_keys)
         )
+
+    info = normalize_service_account_info(info)
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
