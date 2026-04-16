@@ -195,7 +195,6 @@ def safe_float(value) -> float:
     text = str(value).strip()
     text = text.replace("R$", "").replace(" ", "")
 
-    # 1.234,56 -> 1234.56
     if "," in text and "." in text:
         text = text.replace(".", "").replace(",", ".")
     else:
@@ -229,7 +228,6 @@ def worksheet_rows_as_dicts(sheet_name: str) -> list[dict]:
         try:
             item = dict(row)
 
-            # Ignora linha totalmente vazia
             if not any(str(v).strip() for v in item.values()):
                 continue
 
