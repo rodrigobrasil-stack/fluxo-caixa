@@ -6,6 +6,7 @@ import re
 import unicodedata
 import os
 import json
+import traceback
 
 import requests
 import gspread
@@ -39,6 +40,7 @@ cors_origins_env = os.getenv(
 ).strip()
 
 ALLOWED_ORIGINS = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
+
 
 # =========================
 # MODELOS
@@ -84,7 +86,7 @@ class DespesaOut(DespesaIn):
 # =========================
 # APP
 # =========================
-app = FastAPI(title="Fluxo de Caixa API", version="2.1.0")
+app = FastAPI(title="Fluxo de Caixa API", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -98,24 +100,60 @@ app.add_middleware(
 # =========================
 # GOOGLE SHEETS
 # =========================
-def get_gspread_client():
-    if not GOOGLE_SHEETS_CREDENTIALS_JSON:
-        raise RuntimeError("GOOGLE_SHEETS_CREDENTIALS_JSON não configurado.")
+def validate_required_settings() -> None:
+    missing = []
 
-    info = json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON)
+    if not GOOGLE_SHEETS_CREDENTIALS_JSON:
+        missing.append("GOOGLE_SHEETS_CREDENTIALS_JSON")
+
+    if not SPREADSHEET_ID:
+        missing.append("GOOGLE_SHEETS_SPREADSHEET_ID")
+
+    if missing:
+        raise RuntimeError(
+            "Variáveis obrigatórias não configuradas: " + ", ".join(missing)
+        )
+
+
+def get_gspread_client():
+    validate_required_settings()
+
+    try:
+        info = json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"GOOGLE_SHEETS_CREDENTIALS_JSON inválido: {exc}") from exc
+
+    required_keys = ["type", "project_id", "private_key", "client_email", "token_uri"]
+    missing_keys = [key for key in required_keys if key not in info or not info.get(key)]
+    if missing_keys:
+        raise RuntimeError(
+            "JSON da service account incompleto. Campos ausentes: " + ", ".join(missing_keys)
+        )
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    credentials = Credentials.from_service_account_info(info, scopes=scopes)
-    return gspread.authorize(credentials)
+
+    try:
+        credentials = Credentials.from_service_account_info(info, scopes=scopes)
+        return gspread.authorize(credentials)
+    except Exception as exc:
+        raise RuntimeError(f"Erro ao autenticar service account no Google: {exc}") from exc
 
 
 def get_spreadsheet():
-    if not SPREADSHEET_ID:
-        raise RuntimeError("GOOGLE_SHEETS_SPREADSHEET_ID não configurado.")
     client = get_gspread_client()
-    return client.open_by_key(SPREADSHEET_ID)
+
+    try:
+        return client.open_by_key(SPREADSHEET_ID)
+    except Exception as exc:
+        raise RuntimeError(
+            "Erro ao abrir a planilha no Google Sheets. "
+            "Verifique se o GOOGLE_SHEETS_SPREADSHEET_ID está correto "
+            "e se a planilha foi compartilhada com o client_email da service account. "
+            f"Detalhe: {exc}"
+        ) from exc
 
 
 def init_spreadsheet() -> None:
@@ -270,6 +308,7 @@ def calcular_resumo() -> dict:
 def telegram_send_message(chat_id: str, text: str) -> None:
     if not TELEGRAM_API_URL:
         return
+
     try:
         response = requests.post(
             f"{TELEGRAM_API_URL}/sendMessage",
@@ -284,6 +323,7 @@ def telegram_send_message(chat_id: str, text: str) -> None:
 def telegram_get_me():
     if not TELEGRAM_API_URL:
         return
+
     try:
         r = requests.get(f"{TELEGRAM_API_URL}/getMe", timeout=20)
         print(f"[Telegram] getMe => {r.status_code} | {r.text}")
@@ -454,6 +494,7 @@ def processar_update(update: dict) -> None:
     texto = message.get("text", "")
 
     if not chat_id:
+        print("[Telegram] Update sem chat_id, ignorado.")
         return
 
     if TELEGRAM_ALLOWED_CHAT_ID and chat_id != TELEGRAM_ALLOWED_CHAT_ID:
@@ -543,6 +584,7 @@ def processar_update(update: dict) -> None:
 
     except Exception as exc:
         print(f"[Telegram] Erro no processamento: {exc}")
+        print(traceback.format_exc())
         telegram_send_message(chat_id, f"❌ Erro ao processar mensagem: {exc}")
 
 
@@ -551,8 +593,15 @@ def processar_update(update: dict) -> None:
 # =========================
 @app.on_event("startup")
 def startup_event():
-    init_spreadsheet()
-    print(f"[API] Google Sheets conectado. Spreadsheet ID = {SPREADSHEET_ID}")
+    try:
+        validate_required_settings()
+        init_spreadsheet()
+        print(f"[API] Google Sheets conectado. Spreadsheet ID = {SPREADSHEET_ID}")
+    except Exception as exc:
+        print(f"[API] Erro ao conectar no Google Sheets: {exc}")
+        print(traceback.format_exc())
+        raise
+
     print(f"[API] ALLOWED_ORIGINS = {ALLOWED_ORIGINS}")
 
     if TELEGRAM_BOT_TOKEN:
@@ -579,11 +628,27 @@ def health_check():
     return {
         "status": "ok",
         "storage": "google_sheets",
-        "spreadsheet_id": SPREADSHEET_ID,
+        "spreadsheet_id": SPREADSHEET_ID or "não definido",
         "telegram": "ativo" if TELEGRAM_BOT_TOKEN else "desativado",
+        "allowed_chat_id": TELEGRAM_ALLOWED_CHAT_ID or "não definido",
         "allowed_origins": ALLOWED_ORIGINS,
         "webhook_url": TELEGRAM_WEBHOOK_URL or "não definido",
+        "google_credentials_configured": bool(GOOGLE_SHEETS_CREDENTIALS_JSON),
     }
+
+
+@app.get("/api/debug/google-sheets")
+def debug_google_sheets():
+    try:
+        sh = get_spreadsheet()
+        worksheets = [ws.title for ws in sh.worksheets()]
+        return {
+            "ok": True,
+            "spreadsheet_id": SPREADSHEET_ID,
+            "worksheets": worksheets,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/telegram/webhook")
